@@ -131,3 +131,7 @@ class ConnectionInterface(RequestInterface):
         returned to the connection pool or not.
         """
         raise NotImplementedError()  # pragma: nocover
+
+    @property
+    def origin(self) -> Origin:
+        raise NotImplementedError()  # pragma: nocover

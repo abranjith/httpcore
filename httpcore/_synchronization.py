@@ -79,11 +79,34 @@ class Event:
 
 
 class Semaphore:
-    def __init__(self, bound: int) -> None:
-        self._semaphore = threading.Semaphore(value=bound)
 
-    def acquire(self) -> None:
-        self._semaphore.acquire()
+    def __init__(self, bound: int, exc_class: type = None) -> None:
+        self._semaphore = threading.Semaphore(value = bound)
+        self._exc_class = exc_class
+
+    def acquire(self, blocking: bool = True, timeout: float = None) -> bool:
+        if self._exc_class is None:
+            return self._semaphore.acquire(blocking = blocking, timeout = timeout)
+        else :
+            #in case blocking is set to False, dont throw an exception
+            if not self._semaphore.acquire(blocking = blocking, timeout = timeout):
+                if blocking:
+                    raise self._exc_class()
+                else:
+                    return False
+            return True
+
+    __enter__ = acquire
 
     def release(self) -> None:
         self._semaphore.release()
+
+    def __exit__(self, t, v, tb):
+        self.release()
+
+
+class BoundedSemaphore:
+
+    def __init__(self, bound: int, exc_class: type = None) -> None:
+        super().__init__(bound, exc_class = exc_class)
+        self._semaphore = threading.BoundedSemaphore(value = bound)

@@ -1,12 +1,15 @@
 import ssl
 import sys
+from time import time
 from types import TracebackType
-from typing import Iterable, Iterator, List, Optional, Type
+from typing import Iterable, Iterator, List, Optional, Type, Dict, Set, final
+from collections import defaultdict
+from functools import partial
 
-from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
+from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol, PoolTimeout, LockNotAvailable
 from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
-from .._synchronization import Event, Lock
+from .._synchronization import Event, Lock, BoundedSemaphore
 from ..backends.sync import SyncBackend
 from ..backends.base import NetworkBackend
 from .connection import HTTPConnection
@@ -106,26 +109,14 @@ class ConnectionPool(RequestInterface):
         self._local_address = local_address
         self._uds = uds
 
-        self._pool: List[ConnectionInterface] = []
-        self._requests: List[RequestStatus] = []
         self._pool_lock = Lock()
         self._network_backend = (
             SyncBackend() if network_backend is None else network_backend
         )
-
-    def create_connection(self, origin: Origin) -> ConnectionInterface:
-        return HTTPConnection(
-            origin=origin,
-            ssl_context=self._ssl_context,
-            keepalive_expiry=self._keepalive_expiry,
-            http1=self._http1,
-            http2=self._http2,
-            retries=self._retries,
-            local_address=self._local_address,
-            uds=self._uds,
-            network_backend=self._network_backend,
-        )
-
+        self._connection_semaphore = BoundedSemaphore(self._max_connections, exc_class = PoolTimeout)
+        self._origin_locks = defaultdict(partial(BoundedSemaphore, 1, exc_class = PoolTimeout))
+        self._pool: Dict[Origin, List[ConnectionInterface]] = defaultdict(list)
+       
     @property
     def connections(self) -> List[ConnectionInterface]:
         """
@@ -142,69 +133,175 @@ class ConnectionPool(RequestInterface):
         ]
         ```
         """
-        return list(self._pool)
-
-    def _attempt_to_acquire_connection(self, status: RequestStatus) -> bool:
+        return list([connection for origin_connections in self._pool.values() for connection in origin_connections])
+    
+    
+    def _connections_for_origin(self, origin: Origin) -> List[ConnectionInterface]:
         """
-        Attempt to provide a connection that can handle the given origin.
+        Return a list of the connections currently in the pool for the origin.
         """
-        origin = status.request.url.origin
+        return self._pool[origin]
 
-        # If there are queued requests in front of us, then don't acquire a
-        # connection. We handle requests strictly in order.
-        waiting = [s for s in self._requests if s.connection is None]
-        if waiting and waiting[0] is not status:
+    
+    def _get_or_add_connection(self, origin: Origin, timeout: float):
+        origin_lock = self._get_or_add_origin_lock(origin)
+        origin_lock.acquire(timeout = timeout)
+        try:
+            connection = self._get_connection_from_pool(origin)
+            if connection is not None:
+                return connection
+            #if none found, add connection
+            connection = self.create_connection(origin)
+            self._add_to_pool(connection, timeout)
+            return connection
+        finally:
+            origin_lock.release()
+
+    
+    def _get_or_add_origin_lock(self, origin: Origin) -> BoundedSemaphore:
+        with self._pool_lock:
+            return self._origin_locks[origin]
+    
+
+    def _remove_origin_lock(self, origin: Origin) -> None:
+        #TODO - determine if a lock is needed here
+        #TODO - see if removing while iterating can cause issue
+        with self._pool_lock:
+            self._origin_locks.pop(origin)
+    
+    
+    def _get_connection_from_pool(self, origin: Origin) -> Optional[ConnectionInterface]:
+        self._close_and_remove_expired_connections_for_origin(origin)
+        origin_connections = self._connections_for_origin(origin)
+        for idx, connection in enumerate(origin_connections):
+            if connection.is_available():
+                origin_connections.pop(idx)
+                origin_connections.insert(0, connection)
+                return connection
+    
+    
+    def create_connection(self, origin: Origin) -> ConnectionInterface:
+        return HTTPConnection(
+            origin=origin,
+            ssl_context=self._ssl_context,
+            keepalive_expiry=self._keepalive_expiry,
+            http1=self._http1,
+            http2=self._http2,
+            retries=self._retries,
+            local_address=self._local_address,
+            uds=self._uds,
+            network_backend=self._network_backend,
+        )
+
+
+    def _add_to_pool(self, connection: ConnectionInterface, timeout: float) -> None:
+        #if connection pool is full, reactively try cleaning up expired & idle connections across pool and try again
+        if self._try_add_connection_to_pool(connection):
+            return
+        #cleanup expired across pool and try again
+        self._close_and_remove_all_expired_connections()
+        if self._try_add_connection_to_pool(connection):
+            return
+        #remove idle connections
+        self._close_and_remove_idle_connections()
+        if self._try_add_connection_to_pool(connection):
+            return
+        self._connection_semaphore.acquire(timeout = timeout)
+        self._connections_for_origin(connection.origin).insert(0, connection)
+
+    
+    def _try_add_connection_to_pool(self, connection: ConnectionInterface) -> None:
+        if self._connection_semaphore.acquire(blocking = False):
+            self._connections_for_origin(connection.origin).insert(0, connection)
+            return True
+        return False
+
+    
+    def _remove_from_pool(self, connection: ConnectionInterface) -> None:
+        connections_for_origin = self._connections_for_origin(connection.origin)
+        if connection in connections_for_origin:
+            connections_for_origin.remove(connection)
+            self._connection_semaphore.release()
+            if not connections_for_origin:
+                del connections_for_origin
+                self._remove_origin_lock(connection.origin)
+
+    
+    def _close_and_remove_all_expired_connections(self) -> None:
+        for origin, origin_lock in self._origin_locks:
+            if origin_lock.acquire(blocking = False):
+                self._close_and_remove_expired_connections_for_origin(origin)
+                origin_lock.release()
+    
+
+    def _close_and_remove_all_connections(self) -> None:
+        for origin, origin_lock in self._origin_locks:
+            if origin_lock.acquire(blocking = False):
+                self._close_and_remove_connections_for_origin(origin)
+                origin_lock.release()
+            else:
+                raise LockNotAvailable(f"Couldn't acquire lock for origin {origin}")
+    
+    
+    def _close_and_remove_idle_connections(self) -> None:
+        #TODO - ideally we would like to keep only self._max_keepalive_connections alive. Below logic uses self._max_connections as the keep alive limit instead
+        for origin, origin_lock in self._origin_locks:
+            if not self._is_pool_full():
+                return
+            if origin_lock.acquire(blocking = False):
+                while self._is_pool_full() and self._close_and_remove_lru_idle_connection_for_origin(origin):
+                    continue
+                origin_lock.release()
+    
+    
+    #using semapahore to check if pool is full
+    def _is_pool_full(self) -> bool:
+        if self._connection_semaphore.acquire(blocking = False):
+            self._connection_semaphore.release()
             return False
-
-        # Reuse an existing connection if one is currently available.
-        for idx, connection in enumerate(self._pool):
-            if connection.can_handle_request(origin) and connection.is_available():
-                self._pool.pop(idx)
-                self._pool.insert(0, connection)
-                status.set_connection(connection)
-                return True
-
-        # If the pool is currently full, attempt to close one idle connection.
-        if len(self._pool) >= self._max_connections:
-            for idx, connection in reversed(list(enumerate(self._pool))):
-                if connection.is_idle():
-                    connection.close()
-                    self._pool.pop(idx)
-                    break
-
-        # If the pool is still full, then we cannot acquire a connection.
-        if len(self._pool) >= self._max_connections:
-            return False
-
-        # Otherwise create a new connection.
-        connection = self.create_connection(origin)
-        self._pool.insert(0, connection)
-        status.set_connection(connection)
         return True
 
-    def _close_expired_connections(self) -> None:
-        """
-        Clean up the connection pool by closing off any connections that have expired.
-        """
-        # Close any connections that have expired their keep-alive time.
-        for idx, connection in reversed(list(enumerate(self._pool))):
+    
+    def _close_and_remove_expired_connections_for_origin(self, origin: Origin) -> None:
+        self._close_and_remove_expired_connections(self._connections_for_origin(origin))
+
+    
+    def _close_and_remove_expired_connections(self, connections: List[ConnectionInterface]) -> None:
+        for connection in reversed(list(connections)):
             if connection.has_expired():
                 connection.close()
-                self._pool.pop(idx)
+            if connection.is_closed():
+                self._remove_from_pool(connection)
 
-        # If the pool size exceeds the maximum number of allowed keep-alive connections,
-        # then close off idle connections as required.
-        pool_size = len(self._pool)
-        for idx, connection in reversed(list(enumerate(self._pool))):
-            if connection.is_idle() and pool_size > self._max_keepalive_connections:
+
+    def _close_and_remove_connections_for_origin(self, origin: Origin) -> None:
+        self._close_and_remove_connections(self._connections_for_origin(origin))
+
+
+    def _close_and_remove_connections(self, connections: List[ConnectionInterface]) -> None:
+        for connection in reversed(list(connections)):
+            connection.close()
+            self._remove_from_pool(connection)
+
+
+    def _close_and_remove_lru_idle_connection_for_origin(self, origin: Origin) -> None:
+        self._close_and_remove_lru_idle_connection(self._connections_for_origin(origin))
+
+
+    def _close_and_remove_lru_idle_connection(self, connections: List[ConnectionInterface]) -> None:
+        if(len(connections)) == 0:
+            return False
+        for connection in reversed(list(connections)):
+            if connection.is_idle():
                 connection.close()
-                self._pool.pop(idx)
-                pool_size -= 1
+                self._remove_from_pool(connection)
+                return True
+        return False
+
 
     def handle_request(self, request: Request) -> Response:
         """
         Send an HTTP request, and return an HTTP response.
-
         This is the core implementation that is called into by `.request()` or `.stream()`.
         """
         scheme = request.url.scheme.decode()
@@ -217,17 +314,11 @@ class ConnectionPool(RequestInterface):
                 f"Request URL has an unsupported protocol '{scheme}://'."
             )
 
-        status = RequestStatus(request)
-
-        with self._pool_lock:
-            self._requests.append(status)
-            self._close_expired_connections()
-            self._attempt_to_acquire_connection(status)
-
         while True:
             timeouts = request.extensions.get("timeout", {})
             timeout = timeouts.get("pool", None)
-            connection = status.wait_for_connection(timeout=timeout)
+            origin = request.url.origin
+            connection = self._get_or_add_connection(origin, timeout)
             try:
                 response = connection.handle_request(request)
             except ConnectionNotAvailable:
@@ -238,13 +329,9 @@ class ConnectionPool(RequestInterface):
                 # requests are queued waiting for a single connection, which
                 # might end up as an HTTP/2 connection, but which actually ends
                 # up as HTTP/1.1.
-                with self._pool_lock:
-                    # Maintain our position in the request queue, but reset the
-                    # status so that the request becomes queued again.
-                    status.unset_connection()
-                    self._attempt_to_acquire_connection(status)
+                connection = self._get_or_add_connection(origin, timeout)
             except Exception as exc:
-                self.response_closed(status)
+                self.response_closed(request)
                 raise exc
             else:
                 break
@@ -256,49 +343,35 @@ class ConnectionPool(RequestInterface):
         return Response(
             status=response.status,
             headers=response.headers,
-            content=ConnectionPoolByteStream(response.stream, self, status),
+            content=ConnectionPoolByteStream(response.stream, self, request),
             extensions=response.extensions,
         )
 
-    def response_closed(self, status: RequestStatus) -> None:
+    def response_closed(self, connection: ConnectionInterface) -> None:
         """
         This method acts as a callback once the request/response cycle is complete.
 
         It is called into from the `ConnectionPoolByteStream.close()` method.
         """
-        assert status.connection is not None
-        connection = status.connection
+        assert connection is not None
 
-        with self._pool_lock:
-            # Update the state of the connection pool.
-            self._requests.remove(status)
+        #remove closed connection if able to acquire lock
+        if connection.is_closed():
+            origin_lock = self._get_or_add_origin_lock(connection.origin)
+            if origin_lock.acquire(blocking = False):
+                self._remove_from_pool(connection)
+                origin_lock.release()
 
-            if connection.is_closed() and connection in self._pool:
-                self._pool.remove(connection)
+        # Housekeeping.
+        self._close_and_remove_all_expired_connections()
 
-            # Since we've had a response closed, it's possible we'll now be able
-            # to service one or more requests that are currently pending.
-            for status in self._requests:
-                if status.connection is None:
-                    acquired = self._attempt_to_acquire_connection(status)
-                    # If we could not acquire a connection for a queued request
-                    # then we don't need to check anymore requests that are
-                    # queued later behind it.
-                    if not acquired:
-                        break
-
-            # Housekeeping.
-            self._close_expired_connections()
 
     def close(self) -> None:
         """
         Close any connections in the pool.
         """
-        with self._pool_lock:
-            for connection in self._pool:
-                connection.close()
-            self._pool = []
-            self._requests = []
+        self._close_and_remove_all_connections()
+        self._pool = defaultdict(list)
 
     def __enter__(self) -> "ConnectionPool":
         return self
@@ -312,6 +385,7 @@ class ConnectionPool(RequestInterface):
         self.close()
 
 
+
 class ConnectionPoolByteStream:
     """
     A wrapper around the response byte stream, that additionally handles
@@ -322,11 +396,11 @@ class ConnectionPoolByteStream:
         self,
         stream: Iterable[bytes],
         pool: ConnectionPool,
-        status: RequestStatus,
+        request: Request,
     ) -> None:
         self._stream = stream
         self._pool = pool
-        self._status = status
+        self._request = request
 
     def __iter__(self) -> Iterator[bytes]:
         for part in self._stream:
@@ -337,4 +411,4 @@ class ConnectionPoolByteStream:
             if hasattr(self._stream, "close"):
                 self._stream.close()  # type: ignore
         finally:
-            self._pool.response_closed(self._status)
+            self._pool.response_closed(self._request)

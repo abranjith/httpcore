@@ -54,6 +54,10 @@ class HTTPConnection(ConnectionInterface):
         self._connection: Optional[ConnectionInterface] = None
         self._connect_failed: bool = False
         self._request_lock = Lock()
+    
+    @property
+    def origin(self) -> Origin:
+        return self._origin
 
     def handle_request(self, request: Request) -> Response:
         if not self.can_handle_request(request.url.origin):

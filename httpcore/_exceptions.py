@@ -37,6 +37,10 @@ class LocalProtocolError(ProtocolError):
     pass
 
 
+class LockNotAvailable(Exception):
+    pass
+
+
 # Timeout errors
 
 
