@@ -105,7 +105,7 @@ class Semaphore:
         self.release()
 
 
-class BoundedSemaphore:
+class BoundedSemaphore(Semaphore):
 
     def __init__(self, bound: int, exc_class: type = None) -> None:
         super().__init__(bound, exc_class = exc_class)

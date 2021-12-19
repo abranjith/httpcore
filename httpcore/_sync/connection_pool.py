@@ -114,7 +114,7 @@ class ConnectionPool(RequestInterface):
             SyncBackend() if network_backend is None else network_backend
         )
         self._connection_semaphore = BoundedSemaphore(self._max_connections, exc_class = PoolTimeout)
-        self._origin_locks = defaultdict(partial(BoundedSemaphore, 1, exc_class = PoolTimeout))
+        self._origin_locks: Dict[Origin, BoundedSemaphore] = defaultdict(partial(BoundedSemaphore, 1, exc_class = PoolTimeout))
         self._pool: Dict[Origin, List[ConnectionInterface]] = defaultdict(list)
        
     @property
@@ -141,6 +141,10 @@ class ConnectionPool(RequestInterface):
         Return a list of the connections currently in the pool for the origin.
         """
         return self._pool[origin]
+    
+    @property
+    def _origin_locks_copy(self):
+        return dict(self._origin_locks)
 
     
     def _get_or_add_connection(self, origin: Origin, timeout: float):
@@ -228,14 +232,14 @@ class ConnectionPool(RequestInterface):
 
     
     def _close_and_remove_all_expired_connections(self) -> None:
-        for origin, origin_lock in self._origin_locks:
+        for origin, origin_lock in self._origin_locks_copy.items():
             if origin_lock.acquire(blocking = False):
                 self._close_and_remove_expired_connections_for_origin(origin)
                 origin_lock.release()
     
 
     def _close_and_remove_all_connections(self) -> None:
-        for origin, origin_lock in self._origin_locks:
+        for origin, origin_lock in self._origin_locks_copy.items():
             if origin_lock.acquire(blocking = False):
                 self._close_and_remove_connections_for_origin(origin)
                 origin_lock.release()
@@ -245,7 +249,7 @@ class ConnectionPool(RequestInterface):
     
     def _close_and_remove_idle_connections(self) -> None:
         #TODO - ideally we would like to keep only self._max_keepalive_connections alive. Below logic uses self._max_connections as the keep alive limit instead
-        for origin, origin_lock in self._origin_locks:
+        for origin, origin_lock in self._origin_locks_copy.items():
             if not self._is_pool_full():
                 return
             if origin_lock.acquire(blocking = False):
@@ -331,7 +335,7 @@ class ConnectionPool(RequestInterface):
                 # up as HTTP/1.1.
                 connection = self._get_or_add_connection(origin, timeout)
             except Exception as exc:
-                self.response_closed(request)
+                self.response_closed(connection)
                 raise exc
             else:
                 break
@@ -343,7 +347,7 @@ class ConnectionPool(RequestInterface):
         return Response(
             status=response.status,
             headers=response.headers,
-            content=ConnectionPoolByteStream(response.stream, self, request),
+            content=ConnectionPoolByteStream(response.stream, self, request, connection),
             extensions=response.extensions,
         )
 
@@ -397,10 +401,12 @@ class ConnectionPoolByteStream:
         stream: Iterable[bytes],
         pool: ConnectionPool,
         request: Request,
+        connection: ConnectionInterface
     ) -> None:
         self._stream = stream
         self._pool = pool
         self._request = request
+        self._connection = connection
 
     def __iter__(self) -> Iterator[bytes]:
         for part in self._stream:
@@ -411,4 +417,4 @@ class ConnectionPoolByteStream:
             if hasattr(self._stream, "close"):
                 self._stream.close()  # type: ignore
         finally:
-            self._pool.response_closed(self._request)
+            self._pool.response_closed(self._connection)
