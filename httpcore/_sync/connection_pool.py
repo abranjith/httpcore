@@ -114,6 +114,7 @@ class ConnectionPool(RequestInterface):
             SyncBackend() if network_backend is None else network_backend
         )
         self._connection_semaphore = BoundedSemaphore(self._max_connections, exc_class = PoolTimeout)
+        self._keepalive_semaphore = BoundedSemaphore(self._max_keepalive_connections)
         self._origin_locks: Dict[Origin, BoundedSemaphore] = defaultdict(partial(BoundedSemaphore, 1, exc_class = PoolTimeout))
         self._pool: Dict[Origin, List[ConnectionInterface]] = defaultdict(list)
        
@@ -133,7 +134,7 @@ class ConnectionPool(RequestInterface):
         ]
         ```
         """
-        return list([connection for origin_connections in self._pool.values() for connection in origin_connections])
+        return list([connection for origin_connections in reversed(self._pool.values()) for connection in origin_connections])
     
     
     def _connections_for_origin(self, origin: Origin) -> List[ConnectionInterface]:
@@ -210,12 +211,12 @@ class ConnectionPool(RequestInterface):
         self._close_and_remove_idle_connections()
         if self._try_add_connection_to_pool(connection):
             return
-        self._connection_semaphore.acquire(timeout = timeout)
+        self._acquire_connection_semaphores(timeout, True)
         self._connections_for_origin(connection.origin).insert(0, connection)
 
     
     def _try_add_connection_to_pool(self, connection: ConnectionInterface) -> None:
-        if self._connection_semaphore.acquire(blocking = False):
+        if self._acquire_connection_semaphores(None, False):
             self._connections_for_origin(connection.origin).insert(0, connection)
             return True
         return False
@@ -225,7 +226,7 @@ class ConnectionPool(RequestInterface):
         connections_for_origin = self._connections_for_origin(connection.origin)
         if connection in connections_for_origin:
             connections_for_origin.remove(connection)
-            self._connection_semaphore.release()
+            self._release_connection_semaphores()
             if not connections_for_origin:
                 del connections_for_origin
                 self._remove_origin_lock(connection.origin)
@@ -248,20 +249,31 @@ class ConnectionPool(RequestInterface):
     
     
     def _close_and_remove_idle_connections(self) -> None:
-        #TODO - ideally we would like to keep only self._max_keepalive_connections alive. Below logic uses self._max_connections as the keep alive limit instead
         for origin, origin_lock in self._origin_locks_copy.items():
-            if not self._is_pool_full():
+            if not self._is_pool_full_or_keepalive_reached():
                 return
             if origin_lock.acquire(blocking = False):
-                while self._is_pool_full() and self._close_and_remove_lru_idle_connection_for_origin(origin):
+                while self._is_pool_full_or_keepalive_reached() and self._close_and_remove_lru_idle_connection_for_origin(origin):
                     continue
-                origin_lock.release()
+                origin_lock.release()                
     
+
+    def _is_pool_full_or_keepalive_reached(self) -> bool:
+        return self._is_pool_full() or self._has_keepalive_reached_maximum()
+
     
     #using semapahore to check if pool is full
     def _is_pool_full(self) -> bool:
         if self._connection_semaphore.acquire(blocking = False):
             self._connection_semaphore.release()
+            return False
+        return True
+
+    
+    #keep alive check
+    def _has_keepalive_reached_maximum(self) -> bool:
+        if self._keepalive_semaphore.acquire(blocking = False):
+            self._keepalive_semaphore.release()
             return False
         return True
 
@@ -301,6 +313,22 @@ class ConnectionPool(RequestInterface):
                 self._remove_from_pool(connection)
                 return True
         return False
+    
+
+    def _acquire_connection_semaphores(self, timeout: float, blocking: bool) -> bool:
+        rv = self._connection_semaphore.acquire(timeout = timeout, blocking = blocking)
+        self._keepalive_semaphore.acquire(blocking = False)
+        return rv
+
+
+    def _release_connection_semaphores(self) -> None:
+        self._connection_semaphore.release()
+        #Keep alive release can be > acquires as each removal from connection pool (regardless of within or outside keep alive max limit)
+        #will call keepalive semapahore release. So ignoring
+        try:
+            self._keepalive_semaphore.release()
+        except ValueError:
+            pass
 
 
     def handle_request(self, request: Request) -> Response:
@@ -366,8 +394,9 @@ class ConnectionPool(RequestInterface):
                 self._remove_from_pool(connection)
                 origin_lock.release()
 
-        # Housekeeping.
+        # Housekeeping
         self._close_and_remove_all_expired_connections()
+        self._close_and_remove_idle_connections()
 
 
     def close(self) -> None:
