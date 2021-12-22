@@ -15,7 +15,7 @@ from ..backends.base import NetworkBackend
 from .connection import HTTPConnection
 from .interfaces import ConnectionInterface, RequestInterface
 
-
+"""
 class RequestStatus:
     def __init__(self, request: Request):
         self.request = request
@@ -38,7 +38,7 @@ class RequestStatus:
         self._connection_acquired.wait(timeout=timeout)
         assert self.connection is not None
         return self.connection
-
+"""
 
 class ConnectionPool(RequestInterface):
     """
@@ -118,6 +118,7 @@ class ConnectionPool(RequestInterface):
         self._origin_locks: Dict[Origin, BoundedSemaphore] = defaultdict(partial(BoundedSemaphore, 1, exc_class = PoolTimeout))
         self._pool: Dict[Origin, List[ConnectionInterface]] = defaultdict(list)
        
+    
     @property
     def connections(self) -> List[ConnectionInterface]:
         """
@@ -136,6 +137,12 @@ class ConnectionPool(RequestInterface):
         """
         return list([connection for origin_connections in reversed(self._pool.values()) for connection in origin_connections])
     
+
+    @property
+    def _origin_locks_copy(self):
+        with self._pool_lock:
+            return dict(self._origin_locks)
+
     
     def _connections_for_origin(self, origin: Origin) -> List[ConnectionInterface]:
         """
@@ -143,11 +150,7 @@ class ConnectionPool(RequestInterface):
         """
         return self._pool[origin]
     
-    @property
-    def _origin_locks_copy(self):
-        return dict(self._origin_locks)
 
-    
     def _get_or_add_connection(self, origin: Origin, timeout: float):
         origin_lock = self._get_or_add_origin_lock(origin)
         origin_lock.acquire(timeout = timeout)
@@ -324,7 +327,7 @@ class ConnectionPool(RequestInterface):
     def _release_connection_semaphores(self) -> None:
         self._connection_semaphore.release()
         #Keep alive release can be > acquires as each removal from connection pool (regardless of within or outside keep alive max limit)
-        #will call keepalive semapahore release. So ignoring
+        #will call keepalive semapahore release. So ignoring exception during release
         try:
             self._keepalive_semaphore.release()
         except ValueError:

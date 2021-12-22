@@ -61,6 +61,10 @@ class HTTP2Connection(ConnectionInterface):
         self._read_exception: typing.Optional[Exception] = None
         self._write_exception: typing.Optional[Exception] = None
         self._connection_error_event: typing.Optional[h2.events.Event] = None
+    
+    @property
+    def origin(self) -> Origin:
+        return self._origin
 
     def handle_request(self, request: Request) -> Response:
         if not self.can_handle_request(request.url.origin):

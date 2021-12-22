@@ -48,6 +48,10 @@ class HTTP11Connection(ConnectionInterface):
         self._state_lock = Lock()
         self._request_count = 0
         self._h11_state = h11.Connection(our_role=h11.CLIENT)
+    
+    @property
+    def origin(self) -> Origin:
+        return self._origin
 
     def handle_request(self, request: Request) -> Response:
         if not self.can_handle_request(request.url.origin):

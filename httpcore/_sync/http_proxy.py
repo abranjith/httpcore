@@ -129,6 +129,10 @@ class ForwardHTTPConnection(ConnectionInterface):
         )
         self._proxy_origin = proxy_origin
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
+    
+    @property
+    def origin(self) -> Origin:
+        return self._connection.origin
 
     def handle_request(self, request: Request) -> Response:
         headers = merge_headers(self._proxy_headers, request.headers)
@@ -194,6 +198,10 @@ class TunnelHTTPConnection(ConnectionInterface):
         self._keepalive_expiry = keepalive_expiry
         self._connect_lock = Lock()
         self._connected = False
+    
+    @property
+    def origin(self) -> Origin:
+        return self._connection.origin
 
     def handle_request(self, request: Request) -> Response:
         timeouts = request.extensions.get("timeout", {})
