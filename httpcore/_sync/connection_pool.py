@@ -172,8 +172,6 @@ class ConnectionPool(RequestInterface):
     
 
     def _remove_origin_lock(self, origin: Origin) -> None:
-        #TODO - determine if a lock is needed here
-        #TODO - see if removing while iterating can cause issue
         with self._pool_lock:
             self._origin_locks.pop(origin)
     
@@ -304,7 +302,7 @@ class ConnectionPool(RequestInterface):
 
 
     def _close_and_remove_lru_idle_connection_for_origin(self, origin: Origin) -> None:
-        self._close_and_remove_lru_idle_connection(self._connections_for_origin(origin))
+        return self._close_and_remove_lru_idle_connection(self._connections_for_origin(origin))
 
 
     def _close_and_remove_lru_idle_connection(self, connections: List[ConnectionInterface]) -> None:
@@ -326,7 +324,8 @@ class ConnectionPool(RequestInterface):
 
     def _release_connection_semaphores(self) -> None:
         self._connection_semaphore.release()
-        #Keep alive release can be > acquires as each removal from connection pool (regardless of within or outside keep alive max limit)
+        #Keep alive sempahore release count can be > number of acquires as each removal of connection from connection pool
+        #(regardless of within or outside keep alive max limit) 
         #will call keepalive semapahore release. So ignoring exception during release
         try:
             self._keepalive_semaphore.release()
